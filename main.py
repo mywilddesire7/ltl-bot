@@ -57,6 +57,30 @@ def now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def parse_date_input(text: str):
+    """
+    Принимает DD.MM.YYYY или YYYY-MM-DD (для совместимости).
+    Возвращает строку YYYY-MM-DD для БД или None.
+    """
+    text = (text or "").strip()
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def format_date_display(db_date: str) -> str:
+    """Преобразует YYYY-MM-DD из БД в DD.MM.YYYY для показа."""
+    if not db_date:
+        return "—"
+    try:
+        return datetime.strptime(db_date, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except (ValueError, TypeError):
+        return db_date
+
+
 def lineup_opens_at(match_date: str, match_time: str) -> datetime:
     match_dt = datetime.strptime(
         f"{match_date} {match_time}", "%Y-%m-%d %H:%M"
@@ -79,12 +103,6 @@ async def fetchall(db, query, params=()):
 
 
 async def resolve_player(db, identifier: str):
-    """
-    Возвращает (user_id, username|None).
-    Поддерживает @username и числовой Telegram ID.
-    - @username: ищем в users. Если нет — (None, None).
-    - ID: если есть в users — (uid, uname), иначе (uid, None) — добавлять можно.
-    """
     identifier = (identifier or "").strip()
     if not identifier:
         return None, None
@@ -1039,8 +1057,9 @@ async def match_list(message: Message):
     buttons = []
     for mid, name, date, time in matches:
         icon = "✅" if lineup_is_open(date, time) else "🔒"
+        pretty = format_date_display(date)
         buttons.append([InlineKeyboardButton(
-            text=f"{icon} {date} | {time} | {name}",
+            text=f"{icon} {pretty} | {time} | {name}",
             callback_data=f"lineup_match_{mid}"
         )])
     await message.answer(
@@ -1536,7 +1555,7 @@ async def admin(message: Message):
         "БЭКАП:\n"
         "/backup — создать копию БД\n\n"
         "Формат добавления:\n"
-        "/add 2026-11-12 | 19:30 | Боруссия | Севилья | https://ссылка"
+        "/add 12.11.2026 | 19:30 | Боруссия | Севилья | https://ссылка"
     )
 
 
@@ -1553,32 +1572,36 @@ async def add_match(message: Message):
         parts = [x.strip() for x in data.split("|")]
         if len(parts) not in (4, 5):
             raise ValueError()
-        date, time, team1, team2 = parts[:4]
+        date_in, time, team1, team2 = parts[:4]
         link = parts[4] if len(parts) == 5 else ""
         if not team1 or not team2:
             raise ValueError()
-        datetime.strptime(date, "%Y-%m-%d")
+
+        date_db = parse_date_input(date_in)
+        if not date_db:
+            raise ValueError()
+
         datetime.strptime(time, "%H:%M")
         if link and not link.startswith("https://"):
             raise ValueError()
 
         async with aiosqlite.connect(DB) as db:
             count = await fetchall(
-                db, "SELECT id FROM matches WHERE date=?", (date,)
+                db, "SELECT id FROM matches WHERE date=?", (date_db,)
             )
             if len(count) >= 5:
                 await message.answer("На эту дату уже добавлено 5 матчей")
                 return
 
         pending_matches[message.from_user.id] = {
-            "date": date, "time": time,
+            "date": date_db, "time": time,
             "team1": team1, "team2": team2,
             "name": f"{team1} — {team2}",
             "link": link,
         }
         await message.answer(
             f"МАТЧ: {team1} — {team2}\n"
-            f"ДАТА: {date}\n"
+            f"ДАТА: {format_date_display(date_db)}\n"
             f"ВРЕМЯ: {time} МСК\n\n"
             "Отправьте фотографию матча\n"
             "Или напишите /skip"
@@ -1586,7 +1609,7 @@ async def add_match(message: Message):
     except Exception:
         await message.answer(
             "❌ ОШИБКА ФОРМАТА\n\n"
-            "/add 2026-11-12 | 19:30 | Боруссия | Севилья | https://ссылка"
+            "/add 12.11.2026 | 19:30 | Боруссия | Севилья | https://ссылка"
         )
 
 
@@ -1608,7 +1631,7 @@ async def save_pending_match(message, photo_id):
     await message.answer(
         f"✅ МАТЧ ДОБАВЛЕН\n\n"
         f"{data['name']}\n"
-        f"📅 {data['date']}\n"
+        f"📅 {format_date_display(data['date'])}\n"
         f"🕒 {data['time']} МСК"
     )
 
@@ -1667,7 +1690,7 @@ async def list_matches(message: Message):
             )
         await message.answer(
             f"#{mid} {name}\n"
-            f"📅 {date}\n"
+            f"📅 {format_date_display(date)}\n"
             f"🕒 {time} МСК\n"
             f"Статус VIP: {'Отправлено' if sent else 'Ожидает'}\n"
             f"📊 Отчётов табов: {reports_count[0]}\n"
@@ -1724,7 +1747,7 @@ async def match_details(message: Message):
     text = (
         f"⚽ МАТЧ #{mid}\n\n"
         f"Название: {name}\n"
-        f"Дата: {date}\n"
+        f"Дата: {format_date_display(date)}\n"
         f"Время: {time} МСК\n"
         f"Команды: {team1 or '—'} vs {team2 or '—'}\n"
         f"Отпись: {status_line}\n"
@@ -1929,7 +1952,7 @@ async def perform_backup(send_to_admin: bool = True) -> str | None:
                     FSInputFile(path),
                     caption=(
                         f"💾 Резервная копия БД\n"
-                        f"{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')} МСК"
+                        f"{datetime.now(TZ).strftime('%d.%m.%Y %H:%M:%S')} МСК"
                     )
                 )
             except Exception as e:
