@@ -39,6 +39,7 @@ dp = Dispatcher()
 
 waiting_start_photo = set()
 pending_matches = {}
+EXTRA_ADMINS: set[int] = set()
 
 
 # ============================================================
@@ -52,6 +53,10 @@ def normalize_name(value: str) -> str:
 
 
 def admin_only(user_id: int) -> bool:
+    return user_id == ADMIN_ID or user_id in EXTRA_ADMINS
+
+
+def root_admin_only(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
 
@@ -362,7 +367,22 @@ async def init_db():
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                added_at TEXT
+            )
+        """)
+
         await db.commit()
+
+
+async def load_admins():
+    global EXTRA_ADMINS
+    async with aiosqlite.connect(DB) as db:
+        rows = await fetchall(db, "SELECT user_id FROM admins")
+        EXTRA_ADMINS = {r[0] for r in rows}
 
 
 # ============================================================
@@ -1524,6 +1544,10 @@ async def admin(message: Message):
         "/roster Клуб — состав клуба\n\n"
         "ПОЛЬЗОВАТЕЛИ:\n"
         "/users — все, кто взаимодействовал с ботом\n\n"
+        "АДМИНЫ:\n"
+        "/admins — список всех админов\n"
+        "/addadmin @username|ID — добавить админа (только главный)\n"
+        "/removeadmin @username|ID — снять админа (только главный)\n\n"
         "БЭКАП:\n"
         "/backup — создать копию БД\n\n"
         "Формат добавления:\n"
@@ -1563,6 +1587,104 @@ async def list_users(message: Message):
         chunk += line + "\n"
     if chunk.strip():
         await message.answer(chunk)
+
+
+@dp.message(Command("addadmin"))
+async def add_admin(message: Message):
+    if not root_admin_only(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /addadmin @username|ID")
+        return
+    identifier = parts[1].strip()
+
+    async with aiosqlite.connect(DB) as db:
+        user_id, uname = await resolve_player(db, identifier)
+        if user_id is None:
+            await message.answer(
+                f"❌ Пользователь {identifier} не найден.\n"
+                "Если это @username — сначала пусть нажмёт /start "
+                "или укажите Telegram ID."
+            )
+            return
+        if user_id == ADMIN_ID:
+            await message.answer("Этот пользователь уже главный админ")
+            return
+        existing = await fetchone(
+            db, "SELECT user_id FROM admins WHERE user_id=?", (user_id,)
+        )
+        if existing:
+            await message.answer(f"ID:{user_id} уже является админом")
+            return
+        await db.execute(
+            "INSERT INTO admins (user_id, username, added_at) VALUES (?, ?, ?)",
+            (user_id, uname, now_str())
+        )
+        await db.commit()
+
+    EXTRA_ADMINS.add(user_id)
+    display = f"@{uname}" if uname else f"ID:{user_id}"
+    await message.answer(f"✅ {display} теперь администратор")
+
+
+@dp.message(Command("removeadmin"))
+async def remove_admin(message: Message):
+    if not root_admin_only(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /removeadmin @username|ID")
+        return
+    identifier = parts[1].strip()
+
+    async with aiosqlite.connect(DB) as db:
+        user_id, uname = await resolve_player(db, identifier)
+        if user_id is None:
+            await message.answer(f"❌ Пользователь {identifier} не найден")
+            return
+        if user_id == ADMIN_ID:
+            await message.answer("Главного админа удалить нельзя")
+            return
+        existing = await fetchone(
+            db, "SELECT user_id FROM admins WHERE user_id=?", (user_id,)
+        )
+        if not existing:
+            await message.answer(f"ID:{user_id} не является админом")
+            return
+        await db.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+        await db.commit()
+
+    EXTRA_ADMINS.discard(user_id)
+    display = f"@{uname}" if uname else f"ID:{user_id}"
+    await message.answer(f"✅ {display} больше не администратор")
+
+
+@dp.message(Command("admins"))
+async def list_admins(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    async with aiosqlite.connect(DB) as db:
+        rows = await fetchall(
+            db,
+            """
+            SELECT a.user_id, COALESCE(u.username, a.username)
+            FROM admins a
+            LEFT JOIN users u ON u.user_id = a.user_id
+            ORDER BY a.added_at
+            """
+        )
+    text = f"👑 ГЛАВНЫЙ АДМИН: {ADMIN_ID}\n\n"
+    if rows:
+        text += "ДОПОЛНИТЕЛЬНЫЕ АДМИНЫ:\n"
+        for uid, uname in rows:
+            if uname:
+                text += f"• @{uname} ({uid})\n"
+            else:
+                text += f"• ID:{uid}\n"
+    else:
+        text += "Дополнительных админов нет"
+    await message.answer(text)
 
 
 # ============================================================
@@ -1654,7 +1776,7 @@ async def skip_photo(message: Message):
 
 
 # ============================================================
-# VIP-ССЫЛКА: ЗАМЕНА / УДАЛЕНИЕ
+# VIP: ЗАМЕНА / УДАЛЕНИЕ
 # ============================================================
 
 @dp.message(Command("setvip"))
@@ -2264,6 +2386,7 @@ async def vip_sender():
 
 async def main():
     await init_db()
+    await load_admins()
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
     vip_task = asyncio.create_task(vip_sender())
