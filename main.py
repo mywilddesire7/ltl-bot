@@ -28,6 +28,7 @@ DB = "ltl.db"
 BACKUP_DIR = "backups"
 BACKUPS_KEEP = 7
 LINEUP_OPEN_MINUTES = 20
+VIP_SEND_BEFORE_MINUTES = 5
 REMINDER_MINUTES = 5
 
 if not TOKEN:
@@ -97,6 +98,12 @@ def match_has_started(match_date: str, match_time: str) -> bool:
     return datetime.now(TZ) >= match_datetime(match_date, match_time)
 
 
+def vip_send_time(match_date: str, match_time: str) -> datetime:
+    return match_datetime(match_date, match_time) - timedelta(
+        minutes=VIP_SEND_BEFORE_MINUTES
+    )
+
+
 async def fetchone(db, query, params=()):
     async with db.execute(query, params) as cursor:
         return await cursor.fetchone()
@@ -161,7 +168,6 @@ def status_icon(done: bool) -> str:
 
 async def notify_opponent_team(db, match_id, opponent_team, match_name,
                                 own_team):
-    """Уведомляет всех игроков клуба соперника, что другая команда отписалась."""
     club = await fetchone(
         db,
         "SELECT id, name FROM clubs WHERE name_lower=?",
@@ -1179,7 +1185,8 @@ async def save_lineup(message, roster_text=None, photo_id=None):
         "✅ СОСТАВ ПРИНЯТ\n\n"
         f"Ваша команда «{team}»: ✅ отписалась\n"
         f"Соперник «{opponent_team or '—'}»: {status_opp}\n\n"
-        "VIP-Ссылка будет отправлена в назначенное время"
+        f"VIP-Ссылка будет отправлена за {VIP_SEND_BEFORE_MINUTES} минут "
+        f"до начала матча"
     )
     return True
 
@@ -1505,7 +1512,9 @@ async def admin(message: Message):
         "/list — список матчей (с кнопками)\n"
         "/match ID — детали матча\n"
         "/delete ID — удалить матч\n"
-        "/setstartphoto — установить фото меню\n\n"
+        "/setstartphoto — установить фото меню\n"
+        "/setvip ID https://ссылка — задать/заменить VIP\n"
+        "/clearvip ID — убрать VIP\n\n"
         "КЛУБЫ:\n"
         "/addclub Название — создать клуб\n"
         "/clubs — список клубов\n"
@@ -1629,7 +1638,8 @@ async def save_pending_match(message, photo_id):
         f"✅ МАТЧ ДОБАВЛЕН\n\n"
         f"{data['name']}\n"
         f"📅 {format_date_display(data['date'])}\n"
-        f"🕒 {data['time']} МСК"
+        f"🕒 {data['time']} МСК\n"
+        f"VIP будет отправлена за {VIP_SEND_BEFORE_MINUTES} минут до матча"
     )
 
 
@@ -1641,6 +1651,118 @@ async def skip_photo(message: Message):
         await message.answer("Сначала добавьте матч через /add")
         return
     await save_pending_match(message, None)
+
+
+# ============================================================
+# VIP-ССЫЛКА: ЗАМЕНА / УДАЛЕНИЕ
+# ============================================================
+
+@dp.message(Command("setvip"))
+async def set_vip(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "Использование: /setvip ID https://ссылка\n"
+            "Чтобы убрать ссылку: /clearvip ID"
+        )
+        return
+    try:
+        match_id = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом")
+        return
+    link = parts[2].strip()
+    if not link.startswith("https://"):
+        await message.answer("Ссылка должна начинаться с https://")
+        return
+
+    async with aiosqlite.connect(DB) as db:
+        match = await fetchone(
+            db,
+            "SELECT name, vip_link, date, send_time FROM matches WHERE id=?",
+            (match_id,)
+        )
+        if not match:
+            await message.answer("Матч не найден")
+            return
+        name, old_link, mdate, mtime = match
+
+        await db.execute(
+            "UPDATE matches SET vip_link=?, sent=0 WHERE id=?",
+            (link, match_id)
+        )
+        await db.execute(
+            "UPDATE lineups SET vip_sent=0 WHERE match_id=?", (match_id,)
+        )
+        await db.commit()
+
+        recipients = await fetchone(
+            db,
+            "SELECT COUNT(*) FROM lineups WHERE match_id=?", (match_id,)
+        )
+
+    send_at = vip_send_time(mdate, mtime)
+    note = ""
+    if old_link:
+        note = f"\n\nСтарая ссылка была:\n{old_link}"
+
+    if match_has_started(mdate, mtime):
+        timing = "⏱ Матч уже начался — рассылка уйдёт в ближайшие секунды."
+    else:
+        timing = (
+            f"⏱ Рассылка уйдёт автоматически в "
+            f"{send_at.strftime('%d.%m.%Y %H:%M')} МСК "
+            f"(за {VIP_SEND_BEFORE_MINUTES} мин до матча)."
+        )
+
+    await message.answer(
+        f"✅ VIP-ссылка обновлена\n\n"
+        f"Матч #{match_id} {name}\n"
+        f"Новая ссылка:\n{link}{note}\n\n"
+        f"Получателей: {recipients[0]}\n"
+        f"Флаги отправки сброшены.\n"
+        f"{timing}"
+    )
+
+
+@dp.message(Command("clearvip"))
+async def clear_vip(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /clearvip ID")
+        return
+    try:
+        match_id = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом")
+        return
+
+    async with aiosqlite.connect(DB) as db:
+        match = await fetchone(
+            db, "SELECT name, vip_link FROM matches WHERE id=?", (match_id,)
+        )
+        if not match:
+            await message.answer("Матч не найден")
+            return
+        name, old_link = match
+        if not old_link:
+            await message.answer(
+                f"У матча #{match_id} {name} и так нет VIP-ссылки"
+            )
+            return
+        await db.execute(
+            "UPDATE matches SET vip_link='' WHERE id=?", (match_id,)
+        )
+        await db.commit()
+
+    await message.answer(
+        f"✅ VIP-ссылка удалена\n\n"
+        f"Матч #{match_id} {name}"
+    )
 
 
 # ============================================================
@@ -1748,6 +1870,8 @@ async def match_details(message: Message):
     else:
         status_line = f"🔒 до {opens_label}"
 
+    vip_at = vip_send_time(date, time).strftime("%d.%m.%Y %H:%M") + " МСК"
+
     text = (
         f"⚽ МАТЧ #{mid}\n\n"
         f"Название: {name}\n"
@@ -1757,6 +1881,7 @@ async def match_details(message: Message):
         f"Отпись: {s1} {team1 or '—'} | {s2} {team2 or '—'}\n"
         f"Окно отписи: {status_line}\n"
         f"VIP-ссылка: {link or '—'}\n"
+        f"VIP-отправка: {vip_at} (за {VIP_SEND_BEFORE_MINUTES} мин)\n"
         f"Статус VIP: {'Отправлено' if sent else 'Ожидает'}\n"
         f"📊 Отчётов табов: {reports_count[0]}\n"
         f"⚽ Составов: {lineups_count[0]}"
@@ -2017,7 +2142,7 @@ async def backup_scheduler():
 
 
 # ============================================================
-# НАПОМИНАНИЕ АДМИНУ ЗА 5 МИНУТ (если обе команды не отписались)
+# НАПОМИНАНИЕ АДМИНУ ЗА 5 МИНУТ
 # ============================================================
 
 async def match_reminder_scheduler():
@@ -2071,28 +2196,32 @@ async def match_reminder_scheduler():
 
 
 # ============================================================
-# АВТО-ОТПРАВКА VIP
+# АВТО-ОТПРАВКА VIP (за 5 минут до матча)
 # ============================================================
 
 async def vip_sender():
     while True:
         try:
             now = datetime.now(TZ)
-            current = now.strftime("%Y-%m-%d %H:%M")
 
             async with aiosqlite.connect(DB) as db:
                 matches = await fetchall(
                     db,
                     """
-                    SELECT id, name, vip_link FROM matches
-                    WHERE date || ' ' || send_time <= ?
-                    AND vip_link IS NOT NULL
+                    SELECT id, name, vip_link, date, send_time FROM matches
+                    WHERE vip_link IS NOT NULL
                     AND vip_link != ''
-                    """,
-                    (current,)
+                    """
                 )
 
-                for match_id, name, link in matches:
+                for match_id, name, link, mdate, mtime in matches:
+                    try:
+                        send_at = vip_send_time(mdate, mtime)
+                    except ValueError:
+                        continue
+                    if now < send_at:
+                        continue
+
                     users = await fetchall(
                         db,
                         """
@@ -2101,6 +2230,9 @@ async def vip_sender():
                         """,
                         (match_id,)
                     )
+                    if not users:
+                        continue
+
                     for lineup_id, user_id in users:
                         try:
                             await bot.send_message(
