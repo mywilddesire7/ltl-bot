@@ -28,6 +28,7 @@ DB = "ltl.db"
 BACKUP_DIR = "backups"
 BACKUPS_KEEP = 7
 LINEUP_OPEN_MINUTES = 20
+REMINDER_MINUTES = 5
 
 if not TOKEN:
     raise ValueError("Проверь BOT_TOKEN в .env")
@@ -58,10 +59,6 @@ def now_str() -> str:
 
 
 def parse_date_input(text: str):
-    """
-    Принимает DD.MM.YYYY или YYYY-MM-DD (для совместимости).
-    Возвращает строку YYYY-MM-DD для БД или None.
-    """
     text = (text or "").strip()
     for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
         try:
@@ -72,7 +69,6 @@ def parse_date_input(text: str):
 
 
 def format_date_display(db_date: str) -> str:
-    """Преобразует YYYY-MM-DD из БД в DD.MM.YYYY для показа."""
     if not db_date:
         return "—"
     try:
@@ -81,15 +77,24 @@ def format_date_display(db_date: str) -> str:
         return db_date
 
 
-def lineup_opens_at(match_date: str, match_time: str) -> datetime:
-    match_dt = datetime.strptime(
+def match_datetime(match_date: str, match_time: str) -> datetime:
+    return datetime.strptime(
         f"{match_date} {match_time}", "%Y-%m-%d %H:%M"
     ).replace(tzinfo=TZ)
-    return match_dt - timedelta(minutes=LINEUP_OPEN_MINUTES)
+
+
+def lineup_opens_at(match_date: str, match_time: str) -> datetime:
+    return match_datetime(match_date, match_time) - timedelta(
+        minutes=LINEUP_OPEN_MINUTES
+    )
 
 
 def lineup_is_open(match_date: str, match_time: str) -> bool:
     return datetime.now(TZ) >= lineup_opens_at(match_date, match_time)
+
+
+def match_has_started(match_date: str, match_time: str) -> bool:
+    return datetime.now(TZ) >= match_datetime(match_date, match_time)
 
 
 async def fetchone(db, query, params=()):
@@ -133,6 +138,53 @@ async def resolve_player(db, identifier: str):
     if row:
         return row[0], row[1]
     return uid, None
+
+
+# ============================================================
+# СТАТУС ОТПИСИ
+# ============================================================
+
+async def team_status(db, match_id, team):
+    if not team:
+        return False
+    row = await fetchone(
+        db,
+        "SELECT COUNT(*) FROM lineups WHERE match_id=? AND team=?",
+        (match_id, team)
+    )
+    return bool(row and row[0] > 0)
+
+
+def status_icon(done: bool) -> str:
+    return "✅" if done else "⏳"
+
+
+async def notify_opponent_team(db, match_id, opponent_team, match_name,
+                                own_team):
+    """Уведомляет всех игроков клуба соперника, что другая команда отписалась."""
+    club = await fetchone(
+        db,
+        "SELECT id, name FROM clubs WHERE name_lower=?",
+        (normalize_name(opponent_team),)
+    )
+    if not club:
+        return
+    members = await fetchall(
+        db,
+        "SELECT user_id FROM club_members WHERE club_id=?",
+        (club[0],)
+    )
+    for (uid,) in members:
+        try:
+            await bot.send_message(
+                uid,
+                f"⚽ {match_name}\n\n"
+                f"✅ Команда «{own_team}» уже отписалась.\n"
+                f"⏳ Ваша команда «{opponent_team}» ещё нет.\n\n"
+                f"Не забудьте отправить состав до начала матча!"
+            )
+        except Exception as e:
+            print(f"Notify team error ({uid}):", e)
 
 
 # ============================================================
@@ -189,6 +241,7 @@ async def init_db():
             "photo_id": "TEXT",
             "team1": "TEXT",
             "team2": "TEXT",
+            "reminder_sent": "INTEGER DEFAULT 0",
         }
         for column, definition in migrations.items():
             if column not in existing:
@@ -303,30 +356,6 @@ async def init_db():
             )
         """)
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS support_tickets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                status TEXT DEFAULT 'open',
-                created_at TEXT,
-                closed_at TEXT
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS support_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticket_id INTEGER NOT NULL,
-                direction TEXT NOT NULL,
-                user_id INTEGER,
-                text TEXT,
-                file_id TEXT,
-                file_type TEXT,
-                created_at TEXT
-            )
-        """)
-
         await db.commit()
 
 
@@ -338,7 +367,7 @@ def main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 ТАБЫ"), KeyboardButton(text="⚽ ОТПИСЬ МАТЧА")],
-            [KeyboardButton(text="🛟 ПОДДЕРЖКА")],
+            [KeyboardButton(text="📋 СТАТУС МАТЧЕЙ")],
         ],
         resize_keyboard=True
     )
@@ -372,264 +401,6 @@ async def set_start_photo(message: Message):
         return
     waiting_start_photo.add(message.from_user.id)
     await message.answer("Отправьте фотографию главного меню")
-
-
-# ============================================================
-# ПОДДЕРЖКА
-# ============================================================
-
-async def get_active_ticket(db, user_id):
-    return await fetchone(
-        db,
-        """
-        SELECT id FROM support_tickets
-        WHERE user_id=? AND status='open'
-        ORDER BY id DESC LIMIT 1
-        """,
-        (user_id,)
-    )
-
-
-async def save_support_message(db, ticket_id, direction, user_id,
-                               text=None, file_id=None, file_type="text"):
-    await db.execute(
-        """
-        INSERT INTO support_messages
-        (ticket_id, direction, user_id, text, file_id, file_type, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (ticket_id, direction, user_id, text, file_id, file_type, now_str())
-    )
-    await db.commit()
-
-
-async def handle_support_message(message: Message) -> bool:
-    user = message.from_user
-    if admin_only(user.id):
-        return False
-
-    async with aiosqlite.connect(DB) as db:
-        ticket = await get_active_ticket(db, user.id)
-        if not ticket:
-            return False
-        ticket_id = ticket[0]
-
-        file_id = None
-        file_type = "text"
-        text = message.text or message.caption
-
-        if message.photo:
-            file_id = message.photo[-1].file_id
-            file_type = "photo"
-        elif message.video:
-            file_id = message.video.file_id
-            file_type = "video"
-        elif message.document:
-            file_id = message.document.file_id
-            file_type = "document"
-        elif message.text:
-            file_type = "text"
-        else:
-            await message.answer(
-                "В поддержку можно отправлять текст, фото, видео или документ."
-            )
-            return True
-
-        await save_support_message(
-            db, ticket_id, "user", user.id, text, file_id, file_type
-        )
-
-    header = (
-        f"🛟 ОБРАЩЕНИЕ #{ticket_id}\n"
-        f"От: @{user.username or 'без username'}\n"
-        f"User ID: {user.id}\n\n"
-    )
-
-    try:
-        if file_type == "photo":
-            await bot.send_photo(ADMIN_ID, file_id, caption=header + (text or ""))
-        elif file_type == "video":
-            await bot.send_video(ADMIN_ID, file_id, caption=header + (text or ""))
-        elif file_type == "document":
-            await bot.send_document(ADMIN_ID, file_id, caption=header + (text or ""))
-        else:
-            await bot.send_message(ADMIN_ID, header + (text or ""))
-    except Exception as e:
-        print("Support forward error:", e)
-
-    await message.answer("✅ Сообщение передано в поддержку")
-    return True
-
-
-@dp.message(F.text == "🛟 ПОДДЕРЖКА")
-async def support_button(message: Message):
-    user = message.from_user
-    async with aiosqlite.connect(DB) as db:
-        ticket = await get_active_ticket(db, user.id)
-        if ticket:
-            await message.answer(
-                f"🛟 У вас уже есть открытое обращение #{ticket[0]}.\n\n"
-                "Продолжайте писать — сообщения будут переданы администрации.\n"
-                "Для завершения: /support_done"
-            )
-            return
-
-        cursor = await db.execute(
-            """
-            INSERT INTO support_tickets (user_id, username, status, created_at)
-            VALUES (?, ?, 'open', ?)
-            """,
-            (user.id, user.username or "", now_str())
-        )
-        await db.commit()
-        ticket_id = cursor.lastrowid
-
-    await message.answer(
-        f"🛟 ОБРАЩЕНИЕ #{ticket_id} СОЗДАНО\n\n"
-        "Опишите вашу проблему текстом, фотографией, видео или документом.\n"
-        "Для завершения: /support_done"
-    )
-
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🛟 НОВОЕ ОБРАЩЕНИЕ #{ticket_id}\n"
-            f"От: @{user.username or 'без username'}\n"
-            f"User ID: {user.id}\n"
-            f"Время: {now_str()} МСК"
-        )
-    except Exception as e:
-        print("Admin notify error:", e)
-
-
-@dp.message(Command("support_done"))
-async def support_done(message: Message):
-    async with aiosqlite.connect(DB) as db:
-        ticket = await get_active_ticket(db, message.from_user.id)
-        if not ticket:
-            await message.answer("У вас нет открытых обращений")
-            return
-        await db.execute(
-            "UPDATE support_tickets SET status='closed', closed_at=? WHERE id=?",
-            (now_str(), ticket[0])
-        )
-        await db.commit()
-
-    await message.answer(f"✅ Обращение #{ticket[0]} закрыто")
-    try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🛟 Пользователь {message.from_user.id} закрыл обращение #{ticket[0]}"
-        )
-    except Exception:
-        pass
-
-
-@dp.message(Command("tickets"))
-async def tickets_list(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    async with aiosqlite.connect(DB) as db:
-        tickets = await fetchall(
-            db,
-            """
-            SELECT id, user_id, username, created_at
-            FROM support_tickets WHERE status='open'
-            ORDER BY id
-            """
-        )
-    if not tickets:
-        await message.answer("Открытых обращений нет")
-        return
-    text = "🛟 ОТКРЫТЫЕ ОБРАЩЕНИЯ:\n\n"
-    for tid, uid, uname, created in tickets:
-        text += f"#{tid} | @{uname or '—'} ({uid}) | {created}\n"
-    text += "\n/reply ID текст — ответить\n/close ID — закрыть"
-    await message.answer(text)
-
-
-@dp.message(Command("reply"))
-async def reply_ticket(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer("Использование: /reply ID текст")
-        return
-    try:
-        ticket_id = int(parts[1])
-    except ValueError:
-        await message.answer("ID должен быть числом")
-        return
-    reply_text = parts[2]
-
-    async with aiosqlite.connect(DB) as db:
-        ticket = await fetchone(
-            db, "SELECT user_id, status FROM support_tickets WHERE id=?",
-            (ticket_id,)
-        )
-        if not ticket:
-            await message.answer("Обращение не найдено")
-            return
-        user_id, status = ticket
-        if status != "open":
-            await message.answer("Обращение уже закрыто")
-            return
-        await save_support_message(
-            db, ticket_id, "admin", message.from_user.id, reply_text, None, "text"
-        )
-
-    try:
-        await bot.send_message(
-            user_id,
-            f"🛟 ОТВЕТ ПО ОБРАЩЕНИЮ #{ticket_id}\n\n{reply_text}"
-        )
-    except Exception as e:
-        await message.answer(f"Не удалось отправить: {e}")
-        return
-    await message.answer(f"✅ Ответ отправлен по обращению #{ticket_id}")
-
-
-@dp.message(Command("close"))
-async def close_ticket(message: Message):
-    if not admin_only(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Использование: /close ID")
-        return
-    try:
-        ticket_id = int(parts[1])
-    except ValueError:
-        await message.answer("ID должен быть числом")
-        return
-
-    async with aiosqlite.connect(DB) as db:
-        ticket = await fetchone(
-            db, "SELECT user_id, status FROM support_tickets WHERE id=?",
-            (ticket_id,)
-        )
-        if not ticket:
-            await message.answer("Обращение не найдено")
-            return
-        user_id, status = ticket
-        if status != "open":
-            await message.answer("Обращение уже закрыто")
-            return
-        await db.execute(
-            "UPDATE support_tickets SET status='closed', closed_at=? WHERE id=?",
-            (now_str(), ticket_id)
-        )
-        await db.commit()
-
-    await message.answer(f"✅ Обращение #{ticket_id} закрыто")
-    try:
-        await bot.send_message(
-            user_id,
-            f"🛟 Администратор закрыл ваше обращение #{ticket_id}"
-        )
-    except Exception:
-        pass
 
 
 # ============================================================
@@ -1035,7 +806,7 @@ async def my_club(message: Message):
 
 
 # ============================================================
-# ОТПИСЬ МАТЧА (составы, окно -20 минут)
+# ОТПИСЬ МАТЧА (составы, окно -20 минут, видимость)
 # ============================================================
 
 @dp.message(F.text == "⚽ ОТПИСЬ МАТЧА")
@@ -1045,26 +816,38 @@ async def match_list(message: Message):
         matches = await fetchall(
             db,
             """
-            SELECT id, name, date, send_time FROM matches
+            SELECT id, name, date, send_time, team1, team2 FROM matches
             WHERE date >= ?
             ORDER BY date, send_time
             """,
             (today,)
         )
-    if not matches:
-        await message.answer("На данный момент матчей нет")
-        return
-    buttons = []
-    for mid, name, date, time in matches:
-        icon = "✅" if lineup_is_open(date, time) else "🔒"
-        pretty = format_date_display(date)
-        buttons.append([InlineKeyboardButton(
-            text=f"{icon} {pretty} | {time} | {name}",
-            callback_data=f"lineup_match_{mid}"
-        )])
+        if not matches:
+            await message.answer("На данный момент матчей нет")
+            return
+
+        buttons = []
+        for mid, name, date, time, team1, team2 in matches:
+            pretty = format_date_display(date)
+            if match_has_started(date, time):
+                buttons.append([InlineKeyboardButton(
+                    text=f"👁 {pretty} {time} | {team1} — {team2}",
+                    callback_data=f"view_lineups_{mid}"
+                )])
+            else:
+                icon = "✅" if lineup_is_open(date, time) else "🔒"
+                s1 = status_icon(await team_status(db, mid, team1))
+                s2 = status_icon(await team_status(db, mid, team2))
+                buttons.append([InlineKeyboardButton(
+                    text=f"{icon} {pretty} {time} | {team1} {s1} — {s2} {team2}",
+                    callback_data=f"lineup_match_{mid}"
+                )])
+
     await message.answer(
         "⚽ ВЫБЕРИТЕ МАТЧ\n\n"
-        f"🔒 — отпись откроется за {LINEUP_OPEN_MINUTES} минут до начала",
+        f"🔒 — отпись откроется за {LINEUP_OPEN_MINUTES} минут до начала\n"
+        f"✅ — команда отписалась, ⏳ — ещё нет\n"
+        "👁 — матч начался, посмотреть составы",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
 
@@ -1099,15 +882,26 @@ async def select_lineup_match(callback: CallbackQuery):
         )
         return
 
+    async with aiosqlite.connect(DB) as db:
+        s1 = status_icon(await team_status(db, match_id, team1))
+        s2 = status_icon(await team_status(db, match_id, team2))
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=team1, callback_data=f"lineup_team_{match_id}_1"
+            text=f"{s1} {team1}", callback_data=f"lineup_team_{match_id}_1"
         )],
         [InlineKeyboardButton(
-            text=team2, callback_data=f"lineup_team_{match_id}_2"
+            text=f"{s2} {team2}", callback_data=f"lineup_team_{match_id}_2"
         )],
     ])
-    caption = f"⚽ {name}\n\nВЫБЕРИТЕ СВОЮ КОМАНДУ"
+    caption = (
+        f"⚽ {name}\n"
+        f"📅 {format_date_display(mdate)} {mtime} МСК\n\n"
+        f"СТАТУС ОТПИСИ:\n"
+        f"{s1} {team1}\n"
+        f"{s2} {team2}\n\n"
+        f"ВЫБЕРИТЕ СВОЮ КОМАНДУ"
+    )
     if photo_id:
         await callback.message.answer_photo(
             photo_id, caption=caption, reply_markup=keyboard
@@ -1189,11 +983,96 @@ async def select_lineup_team(callback: CallbackQuery):
 
 
 # ============================================================
+# ПРОСМОТР СОСТАВОВ ПОСЛЕ НАЧАЛА МАТЧА
+# ============================================================
+
+@dp.callback_query(F.data.startswith("view_lineups_"))
+async def view_lineups_public(callback: CallbackQuery):
+    try:
+        match_id = int(callback.data.split("_")[-1])
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
+    async with aiosqlite.connect(DB) as db:
+        match = await fetchone(
+            db,
+            "SELECT name, date, send_time, team1, team2 "
+            "FROM matches WHERE id=?",
+            (match_id,)
+        )
+        if not match:
+            await callback.answer("Матч не найден", show_alert=True)
+            return
+        name, mdate, mtime, team1, team2 = match
+
+        if not match_has_started(mdate, mtime):
+            await callback.answer(
+                "Составы откроются после начала матча",
+                show_alert=True
+            )
+            return
+
+        lineups = await fetchall(
+            db,
+            """
+            SELECT team, roster_text, photo_id, user_id, submitted_at
+            FROM lineups WHERE match_id=?
+            ORDER BY team, id
+            """,
+            (match_id,)
+        )
+
+    await callback.message.answer(
+        f"👁 СОСТАВЫ МАТЧА\n\n"
+        f"⚽ {name}\n"
+        f"📅 {format_date_display(mdate)} {mtime} МСК"
+    )
+
+    if not lineups:
+        await callback.message.answer("❌ По этому матчу составы не отправлены")
+        await callback.answer()
+        return
+
+    for team in (team1, team2):
+        team_lineups = [l for l in lineups if l[0] == team]
+        if not team_lineups:
+            await callback.message.answer(
+                f"❌ {team}: состав не отправлен"
+            )
+            continue
+        await callback.message.answer(
+            f"✅ {team}: {len(team_lineups)} состав(ов)"
+        )
+        for _, roster, photo, uid, subat in team_lineups:
+            caption = (
+                f"Команда: {team}\n"
+                f"Игрок: {uid}\n"
+                f"Отправлен: {subat}"
+            )
+            try:
+                if photo:
+                    await bot.send_photo(
+                        callback.from_user.id, photo, caption=caption
+                    )
+                else:
+                    await bot.send_message(
+                        callback.from_user.id,
+                        caption + f"\n\n{roster or '—'}"
+                    )
+            except Exception as e:
+                print("Ошибка отправки состава:", e)
+
+    await callback.answer()
+
+
+# ============================================================
 # СОХРАНЕНИЕ СОСТАВА
 # ============================================================
 
 async def save_lineup(message, roster_text=None, photo_id=None):
     user_id = message.from_user.id
+    notify_info = None
 
     async with aiosqlite.connect(DB) as db:
         session = await fetchone(
@@ -1206,7 +1085,7 @@ async def save_lineup(message, roster_text=None, photo_id=None):
 
         match = await fetchone(
             db,
-            "SELECT name, date, send_time FROM matches WHERE id=?",
+            "SELECT name, date, send_time, team1, team2 FROM matches WHERE id=?",
             (match_id,)
         )
         if not match:
@@ -1217,7 +1096,7 @@ async def save_lineup(message, roster_text=None, photo_id=None):
             await message.answer("Матч больше не существует")
             return True
 
-        name, mdate, mtime = match
+        name, mdate, mtime, team1, team2 = match
 
         if not lineup_is_open(mdate, mtime):
             await db.execute(
@@ -1230,6 +1109,26 @@ async def save_lineup(message, roster_text=None, photo_id=None):
                 f"Откроется {opens.strftime('%d.%m.%Y %H:%M')} МСК."
             )
             return True
+
+        if match_has_started(mdate, mtime):
+            await db.execute(
+                "DELETE FROM lineup_sessions WHERE user_id=?", (user_id,)
+            )
+            await db.commit()
+            await message.answer(
+                f"⏳ Матч «{name}» уже начался. Отпись закрыта."
+            )
+            return True
+
+        prev = await fetchone(
+            db,
+            "SELECT COUNT(*) FROM lineups WHERE match_id=? AND team=?",
+            (match_id, team)
+        )
+        is_first_for_team = (prev[0] == 0)
+
+        opponent_team = team2 if team == team1 else team1
+        opponent_done = await team_status(db, match_id, opponent_team)
 
         submitted_at = now_str()
 
@@ -1245,6 +1144,9 @@ async def save_lineup(message, roster_text=None, photo_id=None):
             "DELETE FROM lineup_sessions WHERE user_id=?", (user_id,)
         )
         await db.commit()
+
+        if is_first_for_team and opponent_team:
+            notify_info = (opponent_team, name, team)
 
     caption = (
         f"⚽ НОВЫЙ СОСТАВ\n\n"
@@ -1262,11 +1164,81 @@ async def save_lineup(message, roster_text=None, photo_id=None):
     except Exception as error:
         print("Ошибка отправки админу:", error)
 
+    if notify_info:
+        opponent_team, match_name, own_team = notify_info
+        try:
+            async with aiosqlite.connect(DB) as db:
+                await notify_opponent_team(
+                    db, match_id, opponent_team, match_name, own_team
+                )
+        except Exception as e:
+            print("Notify error:", e)
+
+    status_opp = "✅ уже отписалась" if opponent_done else "⏳ ещё нет"
     await message.answer(
         "✅ СОСТАВ ПРИНЯТ\n\n"
+        f"Ваша команда «{team}»: ✅ отписалась\n"
+        f"Соперник «{opponent_team or '—'}»: {status_opp}\n\n"
         "VIP-Ссылка будет отправлена в назначенное время"
     )
     return True
+
+
+# ============================================================
+# СТАТУС МАТЧЕЙ
+# ============================================================
+
+@dp.message(F.text == "📋 СТАТУС МАТЧЕЙ")
+async def status_overview(message: Message):
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB) as db:
+        matches = await fetchall(
+            db,
+            """
+            SELECT id, name, date, send_time, team1, team2 FROM matches
+            WHERE date >= ?
+            ORDER BY date, send_time
+            """,
+            (today,)
+        )
+        if not matches:
+            await message.answer("На данный момент матчей нет")
+            return
+
+        for mid, name, date, time, team1, team2 in matches:
+            s1 = status_icon(await team_status(db, mid, team1))
+            s2 = status_icon(await team_status(db, mid, team2))
+            pretty = format_date_display(date)
+
+            if match_has_started(date, time):
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="👁 Показать составы",
+                        callback_data=f"view_lineups_{mid}"
+                    )]
+                ])
+                await message.answer(
+                    f"⚽ {name}\n"
+                    f"📅 {pretty} {time} МСК\n"
+                    f"🏁 Матч начался\n\n"
+                    f"{s1} {team1}\n"
+                    f"{s2} {team2}",
+                    reply_markup=kb
+                )
+            else:
+                is_open = lineup_is_open(date, time)
+                if is_open:
+                    lock = "🔓 отпись открыта"
+                else:
+                    opens = lineup_opens_at(date, time)
+                    lock = f"🔒 откроется {opens.strftime('%d.%m.%Y %H:%M')} МСК"
+                await message.answer(
+                    f"⚽ {name}\n"
+                    f"📅 {pretty} {time} МСК\n"
+                    f"{lock}\n\n"
+                    f"{s1} {team1}\n"
+                    f"{s2} {team2}"
+                )
 
 
 # ============================================================
@@ -1439,9 +1411,6 @@ async def receive_photo(message: Message):
         await save_pending_match(message, file_id)
         return
 
-    if await handle_support_message(message):
-        return
-
     if await save_lineup(message, photo_id=file_id):
         return
 
@@ -1469,21 +1438,17 @@ async def receive_photo(message: Message):
     )
 
 
-@dp.message(F.video | F.document)
-async def receive_media(message: Message):
-    await handle_support_message(message)
-
-
 # ============================================================
 # ПРИЁМ ТЕКСТА
 # ============================================================
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def receive_lineup_text(message: Message):
-    if message.text in ("⚽ ОТПИСЬ МАТЧА", "📊 ТАБЫ", "🛟 ПОДДЕРЖКА"):
-        return
-
-    if await handle_support_message(message):
+    if message.text in (
+        "⚽ ОТПИСЬ МАТЧА",
+        "📊 ТАБЫ",
+        "📋 СТАТУС МАТЧЕЙ",
+    ):
         return
 
     user_id = message.from_user.id
@@ -1548,15 +1513,47 @@ async def admin(message: Message):
         "/addplayer Клуб @username|ID — добавить игрока\n"
         "/removeplayer Клуб @username|ID — удалить игрока\n"
         "/roster Клуб — состав клуба\n\n"
-        "ПОДДЕРЖКА:\n"
-        "/tickets — открытые обращения\n"
-        "/reply ID текст — ответить\n"
-        "/close ID — закрыть\n\n"
+        "ПОЛЬЗОВАТЕЛИ:\n"
+        "/users — все, кто взаимодействовал с ботом\n\n"
         "БЭКАП:\n"
         "/backup — создать копию БД\n\n"
         "Формат добавления:\n"
         "/add 12.11.2026 | 19:30 | Боруссия | Севилья | https://ссылка"
     )
+
+
+@dp.message(Command("users"))
+async def list_users(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    async with aiosqlite.connect(DB) as db:
+        total = await fetchone(db, "SELECT COUNT(*) FROM users")
+        users = await fetchall(
+            db,
+            """
+            SELECT user_id, username, first_name
+            FROM users
+            ORDER BY user_id
+            """
+        )
+    if not users:
+        await message.answer("Пока никто не взаимодействовал с ботом")
+        return
+
+    header = f"👥 ПОЛЬЗОВАТЕЛИ БОТА (всего {total[0]})\n\n"
+    lines = []
+    for uid, uname, fname in users:
+        label = f"@{uname}" if uname else (fname or "—")
+        lines.append(f"{uid} — {label}")
+
+    chunk = header
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3800:
+            await message.answer(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        await message.answer(chunk)
 
 
 # ============================================================
@@ -1671,14 +1668,14 @@ async def list_matches(message: Message):
         matches = await fetchall(
             db,
             """
-            SELECT id, date, send_time, name, sent FROM matches
+            SELECT id, date, send_time, name, sent, team1, team2 FROM matches
             ORDER BY date, send_time
             """
         )
     if not matches:
         await message.answer("Матчей пока нет")
         return
-    for mid, date, time, name, sent in matches:
+    for mid, date, time, name, sent, team1, team2 in matches:
         async with aiosqlite.connect(DB) as db:
             reports_count = await fetchone(
                 db,
@@ -1688,10 +1685,13 @@ async def list_matches(message: Message):
                 db,
                 "SELECT COUNT(*) FROM lineups WHERE match_id=?", (mid,)
             )
+            s1 = status_icon(await team_status(db, mid, team1))
+            s2 = status_icon(await team_status(db, mid, team2))
         await message.answer(
             f"#{mid} {name}\n"
             f"📅 {format_date_display(date)}\n"
             f"🕒 {time} МСК\n"
+            f"Отпись: {s1} {team1 or '—'} | {s2} {team2 or '—'}\n"
             f"Статус VIP: {'Отправлено' if sent else 'Ожидает'}\n"
             f"📊 Отчётов табов: {reports_count[0]}\n"
             f"⚽ Составов: {lineups_count[0]}",
@@ -1734,15 +1734,19 @@ async def match_details(message: Message):
             db,
             "SELECT COUNT(*) FROM lineups WHERE match_id=?", (match_id,)
         )
+        s1 = status_icon(await team_status(db, match_id, match[4]))
+        s2 = status_icon(await team_status(db, match_id, match[5]))
 
     (mid, name, date, time, team1, team2, link, sent, photo) = match
 
     opens_at = lineup_opens_at(date, time)
     opens_label = opens_at.strftime("%d.%m.%Y %H:%M") + " МСК"
-    status_line = (
-        "✅ открыта" if lineup_is_open(date, time)
-        else f"🔒 до {opens_label}"
-    )
+    if match_has_started(date, time):
+        status_line = "🏁 матч начался"
+    elif lineup_is_open(date, time):
+        status_line = "✅ открыта"
+    else:
+        status_line = f"🔒 до {opens_label}"
 
     text = (
         f"⚽ МАТЧ #{mid}\n\n"
@@ -1750,7 +1754,8 @@ async def match_details(message: Message):
         f"Дата: {format_date_display(date)}\n"
         f"Время: {time} МСК\n"
         f"Команды: {team1 or '—'} vs {team2 or '—'}\n"
-        f"Отпись: {status_line}\n"
+        f"Отпись: {s1} {team1 or '—'} | {s2} {team2 or '—'}\n"
+        f"Окно отписи: {status_line}\n"
         f"VIP-ссылка: {link or '—'}\n"
         f"Статус VIP: {'Отправлено' if sent else 'Ожидает'}\n"
         f"📊 Отчётов табов: {reports_count[0]}\n"
@@ -2012,6 +2017,60 @@ async def backup_scheduler():
 
 
 # ============================================================
+# НАПОМИНАНИЕ АДМИНУ ЗА 5 МИНУТ (если обе команды не отписались)
+# ============================================================
+
+async def match_reminder_scheduler():
+    while True:
+        try:
+            now = datetime.now(TZ)
+            async with aiosqlite.connect(DB) as db:
+                matches = await fetchall(
+                    db,
+                    """
+                    SELECT id, name, date, send_time, team1, team2
+                    FROM matches
+                    WHERE reminder_sent=0
+                    """
+                )
+                for mid, name, date, time, team1, team2 in matches:
+                    try:
+                        mdt = match_datetime(date, time)
+                    except ValueError:
+                        continue
+                    delta = mdt - now
+                    if timedelta(0) < delta <= timedelta(minutes=REMINDER_MINUTES):
+                        s1 = await team_status(db, mid, team1)
+                        s2 = await team_status(db, mid, team2)
+                        if not s1 and not s2:
+                            minutes_left = max(
+                                1, int(delta.total_seconds() // 60)
+                            )
+                            try:
+                                await bot.send_message(
+                                    ADMIN_ID,
+                                    f"⚠️ ВНИМАНИЕ\n\n"
+                                    f"Матч «{name}» начнётся через "
+                                    f"{minutes_left} мин. (в {time} МСК)\n"
+                                    f"📅 {format_date_display(date)}\n\n"
+                                    f"❌ {team1} — не отписалась\n"
+                                    f"❌ {team2} — не отписалась\n\n"
+                                    f"Ни одна команда не отправила состав!"
+                                )
+                            except Exception as e:
+                                print("Reminder send error:", e)
+                        await db.execute(
+                            "UPDATE matches SET reminder_sent=1 WHERE id=?",
+                            (mid,)
+                        )
+                        await db.commit()
+        except Exception as e:
+            print("Reminder loop error:", e)
+
+        await asyncio.sleep(60)
+
+
+# ============================================================
 # АВТО-ОТПРАВКА VIP
 # ============================================================
 
@@ -2077,6 +2136,7 @@ async def main():
 
     vip_task = asyncio.create_task(vip_sender())
     backup_task = asyncio.create_task(backup_scheduler())
+    reminder_task = asyncio.create_task(match_reminder_scheduler())
 
     print("LTL BOT запущен")
 
@@ -2085,6 +2145,7 @@ async def main():
     finally:
         vip_task.cancel()
         backup_task.cancel()
+        reminder_task.cancel()
         await bot.session.close()
 
 
