@@ -1212,7 +1212,7 @@ async def save_lineup(message, roster_text=None, photo_id=None):
 
 
 # ============================================================
-# СТАТУС МАТЧЕЙ
+# СТАТУС МАТЧЕЙ + /today
 # ============================================================
 
 @dp.message(F.text == "📋 СТАТУС МАТЧЕЙ")
@@ -1266,6 +1266,81 @@ async def status_overview(message: Message):
                     f"{s1} {team1}\n"
                     f"{s2} {team2}"
                 )
+
+
+@dp.message(Command("today"))
+async def today_matches(message: Message):
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+
+    async with aiosqlite.connect(DB) as db:
+        matches = await fetchall(
+            db,
+            """
+            SELECT id, name, date, send_time, team1, team2
+            FROM matches
+            WHERE date = ?
+            ORDER BY send_time
+            """,
+            (today,)
+        )
+        if not matches:
+            await message.answer(
+                f"📅 На сегодня ({format_date_display(today)}) матчей нет"
+            )
+            return
+
+        await message.answer(
+            f"📅 МАТЧИ НА СЕГОДНЯ ({format_date_display(today)})\n"
+            f"Всего: {len(matches)}"
+        )
+
+        for mid, name, date, time, team1, team2 in matches:
+            s1 = status_icon(await team_status(db, mid, team1))
+            s2 = status_icon(await team_status(db, mid, team2))
+
+            if match_has_started(date, time):
+                window = "🏁 матч начался"
+            elif lineup_is_open(date, time):
+                window = "🔓 отпись открыта"
+            else:
+                opens = lineup_opens_at(date, time)
+                window = f"🔒 отпись с {opens.strftime('%H:%M')} МСК"
+
+            row = await fetchone(
+                db,
+                "SELECT vip_link, sent FROM matches WHERE id=?",
+                (mid,)
+            )
+            vip_link, sent = row if row else (None, 0)
+            if vip_link:
+                if sent:
+                    vip_status = "✅ VIP отправлена"
+                elif datetime.now(TZ) >= vip_send_time(date, time):
+                    vip_status = "⏳ VIP уйдёт в ближайшие секунды"
+                else:
+                    vip_at = vip_send_time(date, time).strftime("%H:%M")
+                    vip_status = f"⏳ VIP в {vip_at} МСК"
+            else:
+                vip_status = "— VIP нет"
+
+            if match_has_started(date, time):
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="👁 Показать составы",
+                        callback_data=f"view_lineups_{mid}"
+                    )]
+                ])
+            else:
+                kb = match_actions_kb(mid)
+
+            await message.answer(
+                f"⚽ {name}\n"
+                f"🕒 {time} МСК\n"
+                f"{window}\n\n"
+                f"Отпись: {s1} {team1 or '—'} | {s2} {team2 or '—'}\n"
+                f"{vip_status}",
+                reply_markup=kb
+            )
 
 
 # ============================================================
@@ -1530,6 +1605,7 @@ async def admin(message: Message):
         "МАТЧИ:\n"
         "/add — добавить матч\n"
         "/list — список матчей (с кнопками)\n"
+        "/today — матчи на сегодня\n"
         "/match ID — детали матча\n"
         "/delete ID — удалить матч\n"
         "/setstartphoto — установить фото меню\n"
