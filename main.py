@@ -496,16 +496,33 @@ async def my_club(message: Message):
 async def notify_reviewers(req_id, uid, uname, cid, cname, cap_id):
     revs = set(EXTRA_ADMINS) | {ADMIN_ID}
     if cap_id: revs.add(cap_id)
+
+    old_name = None
+    async with aiosqlite.connect(DB) as db:
+        old = await fetchone(
+            "SELECT c.name FROM club_members m JOIN clubs c ON c.id=m.club_id WHERE m.user_id=?",
+            (uid,))
+        if old: old_name = old[0]
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_req_{req_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_req_{req_id}"),
     ]])
-    text = f"📨 ЗАЯВКА В «{cname}»\n\nОт: @{uname or uid} ({uid})\nЗаявка #{req_id}"
+
+    if old_name and old_name != cname:
+        header = f"📨 ЗАЯВКА (ПЕРЕВОД) В «{cname}»"
+        note = f"\n🔄 Переход из «{old_name}»"
+    else:
+        header = f"📨 ЗАЯВКА В «{cname}»"
+        note = ""
+
+    text = f"{header}\n\nОт: @{uname or uid} ({uid}){note}\nЗаявка #{req_id}"
     for r in revs:
         try:
             await bot.send_message(r, text, reply_markup=kb)
         except Exception as e:
             print(f"notify_rev ({r}):", e)
+
 
 @dp.callback_query(F.data.startswith("request_join_"))
 async def handle_request_join(callback: CallbackQuery):
@@ -535,36 +552,96 @@ async def handle_request_join(callback: CallbackQuery):
     await callback.message.answer(f"✅ Заявка в «{club[1]}» отправлена (№{rid})")
     await callback.answer("Отправлено")
 
+
 @dp.callback_query(F.data.startswith("accept_req_"))
 async def accept_request(callback: CallbackQuery):
     try:
         rid = int(callback.data.split("_")[-1])
     except ValueError:
         await callback.answer("Ошибка", show_alert=True); return
+
     uid = callback.from_user.id
-    async with aiosqlite.connect(DB) as db:
-        req = await fetchone(db,
-            "SELECT r.user_id, r.club_id, r.status, c.name, c.captain_id, COALESCE(u.username,'') "
-            "FROM club_requests r JOIN clubs c ON c.id=r.club_id "
-            "LEFT JOIN users u ON u.user_id=r.user_id WHERE r.id=?", (rid,))
-        if not req:
-            await callback.answer("Нет заявки", show_alert=True); return
-        aid, cid, st, cname, cap, aun = req
-        if not (admin_only(uid) or uid == cap):
-            await callback.answer("Нет прав", show_alert=True); return
-        if st != "pending":
-            await callback.answer(f"Уже {st}", show_alert=True); return
-        if not await fetchone(db, "SELECT id FROM club_members WHERE club_id=? AND user_id=?", (cid, aid)):
-            await db.execute("INSERT INTO club_members (club_id, user_id, username, added_at) VALUES (?, ?, ?, ?)", (cid, aid, aun or None, now_str()))
-        await db.execute("UPDATE club_requests SET status='accepted', decided_at=?, decided_by=? WHERE id=?", (now_str(), uid, rid))
-        await db.commit()
+    old_name = None
+    new_name = None
+    applicant_id = None
+    applicant_uname = ""
+    old_cap_id = None
+
     try:
-        await callback.message.edit_text((callback.message.text or "") + "\n\n✅ Принята", reply_markup=None)
-    except Exception: pass
+        async with aiosqlite.connect(DB) as db:
+            req = await fetchone(db,
+                "SELECT r.user_id, r.club_id, r.status, c.name, c.captain_id, COALESCE(u.username,'') "
+                "FROM club_requests r JOIN clubs c ON c.id=r.club_id "
+                "LEFT JOIN users u ON u.user_id=r.user_id WHERE r.id=?",
+                (rid,))
+            if not req:
+                await callback.answer("Заявка не найдена", show_alert=True); return
+            applicant_id, cid, st, new_name, cap, applicant_uname = req
+
+            if not (admin_only(uid) or uid == cap):
+                await callback.answer("Нет прав", show_alert=True); return
+            if st != "pending":
+                await callback.answer(f"Уже обработана ({st})", show_alert=True); return
+
+            old = await fetchone(db,
+                "SELECT c.id, c.name, c.captain_id FROM club_members m "
+                "JOIN clubs c ON c.id=m.club_id WHERE m.user_id=?",
+                (applicant_id,))
+
+            if old:
+                old_cid, old_name, old_cap_id = old
+                if old_cid == cid:
+                    await db.execute(
+                        "UPDATE club_requests SET status='accepted', decided_at=?, decided_by=? WHERE id=?",
+                        (now_str(), uid, rid))
+                    await db.commit()
+                    await callback.answer("Игрок уже в этом клубе")
+                    return
+                if old_cap_id == applicant_id:
+                    await callback.answer(
+                        "Игрок — капитан старого клуба. Сначала /setcaptain другого.",
+                        show_alert=True)
+                    return
+                await db.execute("DELETE FROM club_members WHERE user_id=?", (applicant_id,))
+
+            await db.execute(
+                "INSERT INTO club_members (club_id, user_id, username, added_at) "
+                "VALUES (?, ?, ?, ?)",
+                (cid, applicant_id, applicant_uname or None, now_str()))
+            await db.execute(
+                "UPDATE club_requests SET status='accepted', decided_at=?, decided_by=? WHERE id=?",
+                (now_str(), uid, rid))
+            await db.commit()
+    except Exception as e:
+        print("accept_request error:", e)
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+
     try:
-        await bot.send_message(aid, f"✅ Заявка в «{cname}» принята!")
-    except Exception as e: print("notify_app:", e)
-    await callback.answer("Принято")
+        prefix = f"\n\n🔄 Перевод из «{old_name}» принят" if old_name else "\n\n✅ Заявка принята"
+        await callback.message.edit_text((callback.message.text or "") + prefix, reply_markup=None)
+    except Exception:
+        pass
+
+    try:
+        if old_name:
+            msg = f"✅ Вы переведены из «{old_name}» в «{new_name}»!\nТеперь можете отписаться за новый клуб."
+        else:
+            msg = f"✅ Ваша заявка в «{new_name}» принята!\nТеперь можете отписаться за этот клуб."
+        await bot.send_message(applicant_id, msg)
+    except Exception as e:
+        print("notify applicant:", e)
+
+    if old_cap_id and old_cap_id != applicant_id and old_cap_id != uid:
+        try:
+            await bot.send_message(
+                old_cap_id,
+                f"📤 Игрок @{applicant_uname or applicant_id} ({applicant_id}) перешёл из «{old_name}» в «{new_name}».")
+        except Exception as e:
+            print("notify old captain:", e)
+
+    await callback.answer("Перевод принят" if old_name else "Принято")
+
 
 @dp.callback_query(F.data.startswith("reject_req_"))
 async def reject_request(callback: CallbackQuery):
@@ -573,19 +650,24 @@ async def reject_request(callback: CallbackQuery):
     except ValueError:
         await callback.answer("Ошибка", show_alert=True); return
     uid = callback.from_user.id
-    async with aiosqlite.connect(DB) as db:
-        req = await fetchone(db,
-            "SELECT r.user_id, r.club_id, r.status, c.name, c.captain_id FROM club_requests r "
-            "JOIN clubs c ON c.id=r.club_id WHERE r.id=?", (rid,))
-        if not req:
-            await callback.answer("Нет заявки", show_alert=True); return
-        aid, cid, st, cname, cap = req
-        if not (admin_only(uid) or uid == cap):
-            await callback.answer("Нет прав", show_alert=True); return
-        if st != "pending":
-            await callback.answer(f"Уже {st}", show_alert=True); return
-        await db.execute("UPDATE club_requests SET status='rejected', decided_at=?, decided_by=? WHERE id=?", (now_str(), uid, rid))
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DB) as db:
+            req = await fetchone(db,
+                "SELECT r.user_id, r.club_id, r.status, c.name, c.captain_id FROM club_requests r "
+                "JOIN clubs c ON c.id=r.club_id WHERE r.id=?", (rid,))
+            if not req:
+                await callback.answer("Нет заявки", show_alert=True); return
+            aid, cid, st, cname, cap = req
+            if not (admin_only(uid) or uid == cap):
+                await callback.answer("Нет прав", show_alert=True); return
+            if st != "pending":
+                await callback.answer(f"Уже {st}", show_alert=True); return
+            await db.execute("UPDATE club_requests SET status='rejected', decided_at=?, decided_by=? WHERE id=?", (now_str(), uid, rid))
+            await db.commit()
+    except Exception as e:
+        print("reject error:", e)
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
     try:
         await callback.message.edit_text((callback.message.text or "") + "\n\n❌ Отклонена", reply_markup=None)
     except Exception: pass
@@ -593,6 +675,7 @@ async def reject_request(callback: CallbackQuery):
         await bot.send_message(aid, f"❌ Заявка в «{cname}» отклонена")
     except Exception as e: print("notify_app:", e)
     await callback.answer("Отклонено")
+
 
 @dp.message(Command("join"))
 async def join_club_request(message: Message):
@@ -614,6 +697,7 @@ async def join_club_request(message: Message):
         await db.commit()
     await notify_reviewers(rid, uid, uname, club[0], club[1], club[2])
     await message.answer(f"✅ Заявка в «{club[1]}» (№{rid})")
+
 
 @dp.message(Command("requests"))
 async def show_requests(message: Message):
@@ -762,7 +846,7 @@ async def view_lineups_public(callback: CallbackQuery):
     await callback.answer()
 
 
-# ============ SAVE LINEUP (позволяет и после старта) ============
+# ============ SAVE LINEUP ============
 async def save_lineup(message, roster_text=None, photo_id=None):
     uid = message.from_user.id
     notify_info = None
@@ -776,7 +860,6 @@ async def save_lineup(message, roster_text=None, photo_id=None):
             await db.commit()
             await message.answer("Матч удалён"); return True
         name, md, mt, t1, t2 = m
-        # блокируем ТОЛЬКО до открытия окна; после старта — разрешаем
         if not lineup_is_open(md, mt):
             await db.execute("DELETE FROM lineup_sessions WHERE user_id=?", (uid,))
             await db.commit()
@@ -932,7 +1015,6 @@ async def receive_text(message: Message):
     if message.text in menu_labels:
         return
     uid = message.from_user.id
-    # отложенное добавление расписания текстом
     if uid in schedule_pending:
         date_db = schedule_pending.pop(uid)
         await process_schedule_text(message, date_db, message.text)
@@ -954,7 +1036,7 @@ async def receive_text(message: Message):
     await save_lineup(message, roster_text=message.text)
 
 
-# ============ SCHEDULE ADD (текстом) ============
+# ============ SCHEDULE ADD ============
 async def process_schedule_text(message, date_db, text):
     matches = parse_schedule_text(text)
     if not matches:
@@ -962,12 +1044,12 @@ async def process_schedule_text(message, date_db, text):
             "❌ Не найдено матчей.\n\nФормат:\n"
             "⚽ Байер — Марсель ⚽\n19:00 МСК\n\n"
             "⚽ Севилья — Аталанта ⚽\n20:00 МСК\n\n"
-            "VIP расставится автоматически: 1→VIP1, 2→VIP2, 3→VIP3, 4→VIP1, 5→VIP2.")
+            "VIP: 1→VIP1, 2→VIP2, 3→VIP3, 4→VIP1, 5→VIP2.")
         return
     async with aiosqlite.connect(DB) as db:
         exist = await fetchone(db, "SELECT COUNT(*) FROM matches WHERE date=?", (date_db,))
         if exist[0] + len(matches) > 5:
-            await message.answer(f"❌ На {format_date_display(date_db)} уже {exist[0]} матчей, ещё {len(matches)} — превысит лимит 5"); return
+            await message.answer(f"❌ На {format_date_display(date_db)} уже {exist[0]}, ещё {len(matches)} — превысит лимит 5"); return
     added = []
     async with aiosqlite.connect(DB) as db:
         for t1, t2, tm in matches:
@@ -989,18 +1071,17 @@ async def addschedule_cmd(message: Message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         await message.answer(
-            "Использование:\n/addschedule ДД.ММ.ГГГГ\nзатем пришлите блок с матчами\n\n"
-            "Или одной командой после даты"); return
+            "Использование:\n/addschedule ДД.ММ.ГГГГ\nзатем пришлите блок с матчами"); return
     date_db = parse_date_input(parts[1].split()[0])
     if not date_db:
-        await message.answer("❌ Формат даты: /addschedule 14.11.2026"); return
+        await message.answer("❌ Формат: /addschedule 14.11.2026"); return
     schedule_pending[message.from_user.id] = date_db
     await message.answer(
         f"📅 Дата: {format_date_display(date_db)}\n\n"
         "Пришлите блок текстом:\n"
         "⚽ Байер — Марсель ⚽\n19:00 МСК\n\n"
         "⚽ Севилья — Аталанта ⚽\n20:00 МСК\n\n"
-        "VIP расставится: 1→VIP1, 2→VIP2, 3→VIP3, 4→VIP1, 5→VIP2.")
+        "VIP: 1→VIP1, 2→VIP2, 3→VIP3, 4→VIP1, 5→VIP2.")
 
 
 # ============ ADMIN ============
@@ -1011,33 +1092,26 @@ async def admin(message: Message):
         "⚙️ АДМИН-ПАНЕЛЬ\n\n"
         "МАТЧИ:\n"
         "/add ДД.ММ.ГГГГ | HH:MM | T1 | T2 | https://vip\n"
-        "/addschedule ДД.ММ.ГГГГ — добавить расписание текстом\n"
+        "/addschedule ДД.ММ.ГГГГ — расписание текстом\n"
         "/list — все матчи\n"
         "/today — сегодня\n"
         "/day ДД.ММ.ГГГГ — на день\n"
         "/match ID — детали\n"
         "/setmatchtime ID ДД.ММ.ГГГГ HH:MM — изменить время\n"
-        "/setvip ID https://... — задать/заменить VIP\n"
+        "/setvip ID https://... — VIP\n"
         "/clearvip ID — убрать VIP\n"
         "/delete ID — удалить\n"
         "/setstartphoto — фото меню\n\n"
         "КЛУБЫ:\n"
-        "/addclub Название\n"
-        "/clubs\n"
+        "/addclub Название\n/clubs\n"
         "/setcaptain Клуб @username|ID\n"
         "/addplayer Клуб @username|ID\n"
         "/removeplayer Клуб @username|ID\n"
         "/roster Клуб\n\n"
-        "ЗАЯВКИ:\n"
-        "/requests — pending заявки\n\n"
-        "ПОЛЬЗОВАТЕЛИ:\n"
-        "/users\n\n"
-        "АДМИНЫ:\n"
-        "/admins\n"
-        "/addadmin @username|ID\n"
-        "/removeadmin @username|ID\n\n"
-        "БЭКАП:\n"
-        "/backup")
+        "ЗАЯВКИ:\n/requests\n\n"
+        "ПОЛЬЗОВАТЕЛИ:\n/users\n\n"
+        "АДМИНЫ:\n/admins\n/addadmin @username|ID\n/removeadmin @username|ID\n\n"
+        "БЭКАП:\n/backup")
 
 @dp.message(Command("users"))
 async def list_users(message: Message):
@@ -1114,7 +1188,7 @@ async def list_admins(message: Message):
     await message.answer(text)
 
 
-# ============ ADD MATCH (вручную) ============
+# ============ ADD MATCH ============
 @dp.message(Command("add"))
 async def add_match(message: Message):
     if not admin_only(message.from_user.id): return
@@ -1136,10 +1210,9 @@ async def add_match(message: Message):
         pending_matches[message.from_user.id] = {"date": date_db, "time": time, "team1": t1, "team2": t2, "name": f"{t1} — {t2}", "link": link}
         await message.answer(
             f"МАТЧ: {t1} — {t2}\nДАТА: {format_date_display(date_db)}\nВРЕМЯ: {time} МСК\n\n"
-            "Отправьте фото матча или /skip")
+            "Фото матча или /skip")
     except Exception:
-        await message.answer(
-            "❌ Формат:\n/add 12.11.2026 | 19:30 | Боруссия | Севилья | https://vip")
+        await message.answer("❌ Формат:\n/add 12.11.2026 | 19:30 | Боруссия | Севилья | https://vip")
 
 async def save_pending_match(message, photo_id):
     data = pending_matches.pop(message.from_user.id)
@@ -1165,12 +1238,11 @@ async def skip_photo(message: Message):
     await save_pending_match(message, None)
 
 
-# ============ CHANGE MATCH TIME ============
+# ============ CHANGE TIME ============
 @dp.message(Command("setmatchtime"))
 async def set_match_time(message: Message):
     if not admin_only(message.from_user.id): return
     parts = message.text.split()
-    # /setmatchtime ID ДД.ММ.ГГГГ HH:MM
     if len(parts) < 4:
         await message.answer(
             "Использование: /setmatchtime ID ДД.ММ.ГГГГ HH:MM\n"
@@ -1187,38 +1259,30 @@ async def set_match_time(message: Message):
     except ValueError:
         await message.answer("Время: HH:MM"); return
     new_time = parts[3]
-
     async with aiosqlite.connect(DB) as db:
         m = await fetchone(db, "SELECT name, date, send_time FROM matches WHERE id=?", (mid,))
         if not m:
             await message.answer("Матч не найден"); return
         name, old_date, old_time = m
-        # проверка лимита при смене даты
         if old_date != date_db:
             cnt = await fetchone(db, "SELECT COUNT(*) FROM matches WHERE date=? AND id!=?", (date_db, mid))
             if cnt[0] >= 5:
                 await message.answer(f"На {format_date_display(date_db)} уже 5 матчей"); return
-        # сбрасываем статус VIP и reminder — время новое, отправка должна произойти
-        await db.execute(
-            "UPDATE matches SET date=?, send_time=?, sent=0, reminder_sent=0 WHERE id=?",
-            (date_db, new_time, mid))
+        await db.execute("UPDATE matches SET date=?, send_time=?, sent=0, reminder_sent=0 WHERE id=?",
+                         (date_db, new_time, mid))
         await db.execute("UPDATE lineups SET vip_sent=0 WHERE match_id=?", (mid,))
         await db.commit()
-
-        vip = await fetchone(db, "SELECT vip_link FROM matches WHERE id=?", (mid,))
     opens = lineup_opens_at(date_db, new_time).strftime("%d.%m.%Y %H:%M")
     vip_at = vip_send_time(date_db, new_time).strftime("%d.%m.%Y %H:%M")
     await message.answer(
-        f"✅ ВРЕМЯ ИЗМЕНЕНО\n\n"
-        f"Матч #{mid} {name}\n"
+        f"✅ ВРЕМЯ ИЗМЕНЕНО\n\nМатч #{mid} {name}\n"
         f"Было: {format_date_display(old_date)} {old_time} МСК\n"
         f"Стало: {format_date_display(date_db)} {new_time} МСК\n\n"
-        f"🔓 Отпись с {opens} МСК\n"
-        f"🎟 VIP уйдёт в {vip_at} МСК\n"
+        f"🔓 Отпись с {opens} МСК\n🎟 VIP уйдёт в {vip_at} МСК\n"
         f"Флаги VIP и напоминаний сброшены")
 
 
-# ============ SETVIP/CLEARVIP ============
+# ============ SETVIP / CLEARVIP ============
 @dp.message(Command("setvip"))
 async def set_vip(message: Message):
     if not admin_only(message.from_user.id): return
